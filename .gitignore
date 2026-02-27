@@ -1,0 +1,9 @@
+# PlatformIO
+firmware/.pio/
+
+# Python
+__pycache__/
+*.pyc
+
+# Debug scripts
+host/debug_rtss.py
