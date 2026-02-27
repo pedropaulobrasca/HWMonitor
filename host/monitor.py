@@ -18,11 +18,22 @@ import serial
 import serial.tools.list_ports
 
 # ── LibreHardwareMonitor via pythonnet ───────────────────────
-LHM_DLL = os.path.join(
-    os.environ.get("LOCALAPPDATA", ""),
-    r"Microsoft\WinGet\Packages\LibreHardwareMonitor.LibreHardwareMonitor_Microsoft.Winget.Source_8wekyb3d8bbwe",
-    "LibreHardwareMonitorLib.dll",
-)
+def _find_lhm_dll() -> str:
+    """Procura a DLL do LHM: primeiro junto ao exe, depois na instalação winget."""
+    # Se empacotado com PyInstaller, DLL pode estar junto ao exe
+    if getattr(sys, 'frozen', False):
+        bundled = os.path.join(sys._MEIPASS, "LibreHardwareMonitorLib.dll")
+        if os.path.exists(bundled):
+            return bundled
+
+    # Instalação winget padrão
+    return os.path.join(
+        os.environ.get("LOCALAPPDATA", ""),
+        r"Microsoft\WinGet\Packages\LibreHardwareMonitor.LibreHardwareMonitor_Microsoft.Winget.Source_8wekyb3d8bbwe",
+        "LibreHardwareMonitorLib.dll",
+    )
+
+LHM_DLL = _find_lhm_dll()
 
 HAS_LHM = False
 lhm_computer = None

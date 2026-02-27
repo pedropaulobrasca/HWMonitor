@@ -5,5 +5,10 @@ firmware/.pio/
 __pycache__/
 *.pyc
 
+# PyInstaller
+build/
+dist/
+*.spec
+
 # Debug scripts
 host/debug_rtss.py
