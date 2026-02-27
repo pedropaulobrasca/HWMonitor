@@ -9,6 +9,7 @@
 #include <ArduinoJson.h>
 #include <WiFi.h>
 #include <WiFiManager.h>
+#include <HTTPClient.h>
 #include <time.h>
 
 // ── NTP ─────────────────────────────────────────────────────
@@ -24,14 +25,16 @@ WiFiManager wm;
 void setupWiFi();
 void syncNTP();
 void updateNtpTime();
+void fetchLocation();
+void fetchWeather();
 void readSerial();
 void parseJson(const String &json);
 void drawBootScreen(const char* msg);
 void drawConfigScreen();
 void drawIdleScreen();
 void drawGamingScreen();
-void drawCat(int x, int y, int scale, int frame);
-void drawZzz(int x, int y, int frame);
+void drawHeart(int x, int y, int scale, int frame);
+void drawWeatherIcon(int ox, int oy, int s, int code);
 uint16_t lightenColor(uint16_t color);
 
 // ── Display ─────────────────────────────────────────────────
@@ -53,10 +56,10 @@ static const uint16_t COL_DIM      = 0x7BEF;
 static const uint16_t COL_RED      = 0xF800;
 static const uint16_t COL_SCANLINE = 0x0821;
 
-// Cores do gato
-static const uint16_t COL_CAT_BODY = 0x7BEF;
-static const uint16_t COL_CAT_DARK = 0x4A49;
-static const uint16_t COL_CAT_NOSE = 0xFB2C;
+// Cores do coração
+static const uint16_t COL_HEART     = 0xF810;  // vermelho/rosa vibrante
+static const uint16_t COL_HEART_LT  = 0xFB2C;  // rosa claro (brilho)
+static const uint16_t COL_HEART_DK  = 0xC000;  // vermelho escuro (sombra)
 
 // ── Dados recebidos ─────────────────────────────────────────
 struct HWData {
@@ -93,7 +96,6 @@ static const unsigned long GAMING_COOLDOWN_MS = 3000;
 // ── Animação idle ───────────────────────────────────────────
 unsigned long idleAnimTimer = 0;
 int idleFrame = 0;
-int zzzFrame  = 0;
 
 // ── NTP time ────────────────────────────────────────────────
 bool ntpSynced = false;
@@ -102,6 +104,14 @@ static const unsigned long NTP_UPDATE_INTERVAL = 60000;  // atualiza a cada 60s
 
 // ── WiFi ────────────────────────────────────────────────────
 bool wifiConnected = false;
+
+// ── Clima ────────────────────────────────────────────────────
+float weatherLat = 0, weatherLon = 0;
+int   weatherTemp = 0;
+int   weatherCode = -1;
+bool  weatherValid = false;
+unsigned long lastWeatherUpdate = 0;
+static const unsigned long WEATHER_INTERVAL = 900000;  // 15 min
 
 // ============================================================
 // SETUP
@@ -130,6 +140,9 @@ void setup() {
   if (wifiConnected) {
     drawBootScreen("Sincronizando relogio...");
     syncNTP();
+    drawBootScreen("Buscando clima...");
+    fetchLocation();
+    fetchWeather();
   } else {
     drawConfigScreen();
   }
@@ -178,6 +191,51 @@ void updateNtpTime() {
 }
 
 // ============================================================
+// CLIMA — geolocalização por IP + Open-Meteo
+// ============================================================
+void fetchLocation() {
+  HTTPClient http;
+  http.begin("http://ip-api.com/json/?fields=lat,lon");
+  http.setTimeout(5000);
+
+  int code = http.GET();
+  if (code == 200) {
+    StaticJsonDocument<128> doc;
+    if (!deserializeJson(doc, http.getString())) {
+      weatherLat = doc["lat"] | 0.0f;
+      weatherLon = doc["lon"] | 0.0f;
+    }
+  }
+  http.end();
+}
+
+void fetchWeather() {
+  if (weatherLat == 0 && weatherLon == 0) return;
+
+  char url[160];
+  snprintf(url, sizeof(url),
+    "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
+    "&current=temperature_2m,weather_code",
+    weatherLat, weatherLon);
+
+  HTTPClient http;
+  http.begin(url);
+  http.setTimeout(5000);
+
+  int code = http.GET();
+  if (code == 200) {
+    StaticJsonDocument<512> doc;
+    if (!deserializeJson(doc, http.getString())) {
+      weatherTemp = (int)round((float)(doc["current"]["temperature_2m"] | 0.0));
+      weatherCode = doc["current"]["weather_code"] | -1;
+      weatherValid = true;
+      lastWeatherUpdate = millis();
+    }
+  }
+  http.end();
+}
+
+// ============================================================
 // LOOP
 // ============================================================
 void loop() {
@@ -190,6 +248,9 @@ void loop() {
       wifiConnected = true;
       drawBootScreen("Sincronizando relogio...");
       syncNTP();
+      drawBootScreen("Buscando clima...");
+      fetchLocation();
+      fetchWeather();
     } else {
       // Redesenha tela de config periodicamente (animação)
       static unsigned long lastConfigDraw = 0;
@@ -206,6 +267,11 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     wifiConnected = false;
     WiFi.reconnect();
+  }
+
+  // Atualiza clima a cada 15 min
+  if (wifiConnected && (millis() - lastWeatherUpdate > WEATHER_INTERVAL)) {
+    fetchWeather();
   }
 
   readSerial();
@@ -353,33 +419,52 @@ void drawConfigScreen() {
 void drawIdleScreen() {
   spr.fillSprite(COL_BG);
 
-  // Avança animação a cada 800ms
-  if (millis() - idleAnimTimer > 800) {
+  // Avança animação de batida do coração
+  if (millis() - idleAnimTimer > 600) {
     idleAnimTimer = millis();
-    idleFrame = (idleFrame + 1) % 2;
-    zzzFrame  = (zzzFrame + 1) % 4;
+    idleFrame = (idleFrame + 1) % 4;  // 0=normal, 1=grande, 2=normal, 3=pequeno
   }
 
-  // ── Gato dormindo (esquerda) ──
-  int catX = 20;
-  int catY = 35;
-  int scale = 4;
-  drawCat(catX, catY, scale, idleFrame);
-  drawZzz(catX + 14 * scale, catY - 4 * scale, zzzFrame);
+  // ── Coração + "Pa" (esquerda) ──
+  int heartX = 25;
+  int heartY = 18;
+  int heartScale = 4;
+  drawHeart(heartX, heartY, heartScale, idleFrame);
+
+  // Nome "Pa" abaixo do coração
+  spr.setTextColor(COL_HEART_LT);
+  spr.setTextSize(3);
+  spr.setTextDatum(MC_DATUM);
+  spr.drawString("Pa", heartX + 5 * heartScale, heartY + 12 * heartScale);
 
   // ── Relógio grande (direita) ──
   int clockX = 225;
 
   spr.setTextColor(COL_TEXT);
-  spr.setTextSize(5);
+  spr.setTextSize(4);
   spr.setTextDatum(MC_DATUM);
-  spr.drawString(hw.hora, clockX, 70);
+  spr.drawString(hw.hora, clockX, 38);
 
   // Data abaixo
   if (strlen(hw.data) > 0) {
     spr.setTextColor(COL_DIM);
     spr.setTextSize(2);
-    spr.drawString(hw.data, clockX, 105);
+    spr.drawString(hw.data, clockX, 68);
+  }
+
+  // ── Clima ──
+  if (weatherValid) {
+    int weatherY = 105;
+    // Ícone pixel art
+    drawWeatherIcon(clockX - 40, weatherY - 12, 3, weatherCode);
+
+    // Temperatura
+    char wBuf[12];
+    snprintf(wBuf, sizeof(wBuf), "%d%sC", weatherTemp, "\xB0");
+    spr.setTextColor(COL_YELLOW);
+    spr.setTextSize(2);
+    spr.setTextDatum(ML_DATUM);
+    spr.drawString(wBuf, clockX - 2, weatherY);
   }
 
   // ── Rodapé: info do PC (se disponível) ou status WiFi ──
@@ -416,81 +501,151 @@ void drawIdleScreen() {
 }
 
 // ============================================================
-// GATO PIXEL ART — "cat loaf" dormindo, vista lateral
+// CORAÇÃO PIXEL ART — com animação de batida
+// Grid: 11 wide x 10 tall
+// Frames: 0,2=normal  1=expand  3=shrink
 // ============================================================
-void drawCat(int ox, int oy, int s, int frame) {
-  int b = (frame == 1) ? -s : 0;
+void drawHeart(int ox, int oy, int s, int frame) {
+  // Offset para animação de batida
+  int expand = 0;
+  if (frame == 1) expand = 1;       // batida: cresce
+  else if (frame == 3) expand = -1;  // contrai levemente
 
-  #define PX(x, y, col)  spr.fillRect(ox + (x)*s, oy + (y)*s, s, s, col)
-  #define PXB(x, y, col) spr.fillRect(ox + (x)*s, oy + (y)*s + b, s, s, col)
+  int adj = -expand;  // offset de posição (centraliza a escala)
+  int es = s + expand; // tamanho efetivo do pixel (não menor que s-1)
+  if (es < s - 1) es = s - 1;
 
-  // ── Orelhas ──
-  PX(3, 0, COL_CAT_DARK);
-  PX(6, 0, COL_CAT_DARK);
-  PX(2, 1, COL_CAT_DARK); PX(3, 1, COL_CAT_BODY); PX(4, 1, COL_CAT_DARK);
-  PX(5, 1, COL_CAT_DARK); PX(6, 1, COL_CAT_BODY); PX(7, 1, COL_CAT_DARK);
+  #define HP(x, y, col) spr.fillRect(ox + (x)*s + adj, oy + (y)*s + adj, es, es, col)
 
-  // ── Cabeça ──
-  for (int x = 1; x <= 8; x++) PXB(x, 2, COL_CAT_BODY);
-  for (int x = 0; x <= 9; x++) PXB(x, 3, COL_CAT_BODY);
-  for (int x = 0; x <= 9; x++) PXB(x, 4, COL_CAT_BODY);
-  for (int x = 1; x <= 8; x++) PXB(x, 5, COL_CAT_BODY);
+  // Linha 0: topos dos dois "bumps"
+  //    ##  ##
+  HP(1,0,COL_HEART); HP(2,0,COL_HEART); HP(3,0,COL_HEART);
+  HP(7,0,COL_HEART); HP(8,0,COL_HEART); HP(9,0,COL_HEART);
 
-  // Olhos fechados
-  PXB(2, 3, COL_CAT_DARK); PXB(3, 3, COL_CAT_DARK);
-  PXB(6, 3, COL_CAT_DARK); PXB(7, 3, COL_CAT_DARK);
+  // Linha 1: expande
+  // #######.####
+  for (int x = 0; x <= 10; x++) HP(x, 1, COL_HEART);
 
-  // Nariz + boca
-  PXB(4, 4, COL_CAT_NOSE); PXB(5, 4, COL_CAT_NOSE);
-  PXB(3, 5, COL_CAT_DARK); PXB(6, 5, COL_CAT_DARK);
+  // Linha 2-4: cheio
+  for (int x = 0; x <= 10; x++) HP(x, 2, COL_HEART);
+  for (int x = 0; x <= 10; x++) HP(x, 3, COL_HEART);
+  for (int x = 1; x <= 9; x++)  HP(x, 4, COL_HEART);
 
-  // Bigodes
-  PXB(0, 3, COL_CAT_DARK); PXB(9, 3, COL_CAT_DARK);
-  PXB(0, 4, COL_CAT_DARK); PXB(9, 4, COL_CAT_DARK);
+  // Linha 5-8: afunilando
+  for (int x = 2; x <= 8; x++) HP(x, 5, COL_HEART);
+  for (int x = 3; x <= 7; x++) HP(x, 6, COL_HEART);
+  for (int x = 4; x <= 6; x++) HP(x, 7, COL_HEART);
+  HP(5, 8, COL_HEART);
 
-  // ── Corpo ──
-  for (int x = 0; x <= 15; x++) PXB(x, 6, COL_CAT_BODY);
-  for (int x = 0; x <= 16; x++) PXB(x, 7, COL_CAT_BODY);
-  for (int x = 0; x <= 16; x++) PXB(x, 8, COL_CAT_BODY);
-  for (int x = 0; x <= 16; x++) PXB(x, 9, COL_CAT_BODY);
-  for (int x = 1; x <= 15; x++) PXB(x, 10, COL_CAT_BODY);
+  // Brilho (canto superior esquerdo)
+  HP(2, 1, COL_HEART_LT); HP(3, 1, COL_HEART_LT);
+  HP(1, 2, COL_HEART_LT); HP(2, 2, COL_HEART_LT);
 
-  // Listras
-  PXB(5, 7, COL_CAT_DARK);  PXB(9, 7, COL_CAT_DARK);  PXB(13, 7, COL_CAT_DARK);
-  PXB(5, 8, COL_CAT_DARK);  PXB(9, 8, COL_CAT_DARK);  PXB(13, 8, COL_CAT_DARK);
+  // Sombra (borda inferior direita)
+  HP(9, 3, COL_HEART_DK);
+  HP(8, 4, COL_HEART_DK); HP(9, 4, COL_HEART_DK);
+  HP(7, 5, COL_HEART_DK); HP(8, 5, COL_HEART_DK);
+  HP(6, 6, COL_HEART_DK); HP(7, 6, COL_HEART_DK);
+  HP(5, 7, COL_HEART_DK); HP(6, 7, COL_HEART_DK);
 
-  // ── Patinhas ──
-  PX(1, 11, COL_CAT_BODY); PX(2, 11, COL_CAT_BODY); PX(3, 11, COL_CAT_BODY);
-
-  // ── Rabo ──
-  PXB(16, 9, COL_CAT_DARK);
-  PX(17, 8, COL_CAT_DARK);
-  PX(18, 7, COL_CAT_DARK);
-  PX(18, 6, COL_CAT_DARK);
-  PX(17, 5, COL_CAT_DARK);
-
-  #undef PX
-  #undef PXB
+  #undef HP
 }
 
 // ============================================================
-// ZZZ FLUTUANTE
+// ÍCONE CLIMA — pixel art procedural (WMO weather codes)
 // ============================================================
-void drawZzz(int ox, int oy, int frame) {
-  int offsets[] = {0, -3, -6, -3};
-  int yOff = offsets[frame];
+void drawWeatherIcon(int ox, int oy, int s, int code) {
+  #define WP(x, y, col) spr.fillRect(ox + (x)*s, oy + (y)*s, s, s, col)
 
-  spr.setTextColor(COL_DIM);
-  spr.setTextDatum(TL_DATUM);
+  if (code <= 1) {
+    // ── Sol ──
+    uint16_t SUN = COL_YELLOW;
+    // Centro
+    WP(3,2,SUN); WP(4,2,SUN);
+    WP(2,3,SUN); WP(3,3,SUN); WP(4,3,SUN); WP(5,3,SUN);
+    WP(2,4,SUN); WP(3,4,SUN); WP(4,4,SUN); WP(5,4,SUN);
+    WP(3,5,SUN); WP(4,5,SUN);
+    // Raios
+    WP(3,0,SUN); WP(4,0,SUN);
+    WP(0,3,SUN); WP(7,3,SUN);
+    WP(0,4,SUN); WP(7,4,SUN);
+    WP(3,7,SUN); WP(4,7,SUN);
+    WP(1,1,SUN); WP(6,1,SUN);
+    WP(1,6,SUN); WP(6,6,SUN);
 
-  spr.setTextSize(1);
-  spr.drawString("z", ox, oy + yOff + 12);
+  } else if (code == 2) {
+    // ── Sol + nuvem ──
+    uint16_t SUN = COL_YELLOW;
+    uint16_t CLD = COL_DIM;
+    // Sol pequeno (canto superior direito)
+    WP(5,0,SUN); WP(6,0,SUN);
+    WP(5,1,SUN); WP(6,1,SUN);
+    WP(7,0,SUN); WP(4,1,SUN);
+    // Nuvem na frente
+    WP(2,3,CLD); WP(3,3,CLD); WP(4,3,CLD); WP(5,3,CLD);
+    WP(1,4,CLD); WP(2,4,CLD); WP(3,4,CLD); WP(4,4,CLD); WP(5,4,CLD); WP(6,4,CLD);
+    WP(1,5,CLD); WP(2,5,CLD); WP(3,5,CLD); WP(4,5,CLD); WP(5,5,CLD); WP(6,5,CLD);
 
-  spr.setTextSize(1);
-  spr.drawString("z", ox + 8, oy + yOff + 4);
+  } else if (code == 3 || (code >= 45 && code <= 48)) {
+    // ── Nublado / neblina ──
+    uint16_t CLD = COL_DIM;
+    WP(2,1,CLD); WP(3,1,CLD); WP(4,1,CLD); WP(5,1,CLD);
+    WP(1,2,CLD); WP(2,2,CLD); WP(3,2,CLD); WP(4,2,CLD); WP(5,2,CLD); WP(6,2,CLD);
+    WP(1,3,CLD); WP(2,3,CLD); WP(3,3,CLD); WP(4,3,CLD); WP(5,3,CLD); WP(6,3,CLD);
+    WP(0,4,CLD); WP(1,4,CLD); WP(2,4,CLD); WP(3,4,CLD); WP(4,4,CLD); WP(5,4,CLD); WP(6,4,CLD); WP(7,4,CLD);
+    WP(0,5,CLD); WP(1,5,CLD); WP(2,5,CLD); WP(3,5,CLD); WP(4,5,CLD); WP(5,5,CLD); WP(6,5,CLD); WP(7,5,CLD);
 
-  spr.setTextSize(2);
-  spr.drawString("Z", ox + 16, oy + yOff - 6);
+  } else if ((code >= 51 && code <= 67) || (code >= 80 && code <= 82)) {
+    // ── Chuva ──
+    uint16_t CLD = COL_DIM;
+    uint16_t DRP = COL_CYAN;
+    // Nuvem
+    WP(2,0,CLD); WP(3,0,CLD); WP(4,0,CLD); WP(5,0,CLD);
+    WP(1,1,CLD); WP(2,1,CLD); WP(3,1,CLD); WP(4,1,CLD); WP(5,1,CLD); WP(6,1,CLD);
+    WP(0,2,CLD); WP(1,2,CLD); WP(2,2,CLD); WP(3,2,CLD); WP(4,2,CLD); WP(5,2,CLD); WP(6,2,CLD); WP(7,2,CLD);
+    // Gotas
+    WP(1,4,DRP); WP(3,4,DRP); WP(5,4,DRP);
+    WP(2,5,DRP); WP(4,5,DRP); WP(6,5,DRP);
+    WP(1,6,DRP); WP(3,6,DRP); WP(5,6,DRP);
+
+  } else if (code >= 71 && code <= 77) {
+    // ── Neve ──
+    uint16_t CLD = COL_DIM;
+    uint16_t SNW = COL_TEXT;
+    // Nuvem
+    WP(2,0,CLD); WP(3,0,CLD); WP(4,0,CLD); WP(5,0,CLD);
+    WP(1,1,CLD); WP(2,1,CLD); WP(3,1,CLD); WP(4,1,CLD); WP(5,1,CLD); WP(6,1,CLD);
+    WP(0,2,CLD); WP(1,2,CLD); WP(2,2,CLD); WP(3,2,CLD); WP(4,2,CLD); WP(5,2,CLD); WP(6,2,CLD); WP(7,2,CLD);
+    // Flocos
+    WP(2,4,SNW); WP(5,4,SNW);
+    WP(1,5,SNW); WP(4,5,SNW); WP(7,5,SNW);
+    WP(3,6,SNW); WP(6,6,SNW);
+
+  } else if (code >= 95) {
+    // ── Trovoada ──
+    uint16_t CLD = COL_DIM;
+    uint16_t ZAP = COL_YELLOW;
+    uint16_t DRP = COL_CYAN;
+    // Nuvem
+    WP(2,0,CLD); WP(3,0,CLD); WP(4,0,CLD); WP(5,0,CLD);
+    WP(1,1,CLD); WP(2,1,CLD); WP(3,1,CLD); WP(4,1,CLD); WP(5,1,CLD); WP(6,1,CLD);
+    WP(0,2,CLD); WP(1,2,CLD); WP(2,2,CLD); WP(3,2,CLD); WP(4,2,CLD); WP(5,2,CLD); WP(6,2,CLD); WP(7,2,CLD);
+    // Raio
+    WP(4,3,ZAP); WP(3,4,ZAP); WP(4,4,ZAP); WP(5,4,ZAP);
+    WP(3,5,ZAP); WP(4,5,ZAP); WP(2,6,ZAP);
+    // Gotas
+    WP(1,4,DRP); WP(6,5,DRP);
+
+  } else {
+    // Fallback: nuvem genérica
+    uint16_t CLD = COL_DIM;
+    WP(2,1,CLD); WP(3,1,CLD); WP(4,1,CLD); WP(5,1,CLD);
+    WP(1,2,CLD); WP(2,2,CLD); WP(3,2,CLD); WP(4,2,CLD); WP(5,2,CLD); WP(6,2,CLD);
+    WP(0,3,CLD); WP(1,3,CLD); WP(2,3,CLD); WP(3,3,CLD); WP(4,3,CLD); WP(5,3,CLD); WP(6,3,CLD); WP(7,3,CLD);
+    WP(0,4,CLD); WP(1,4,CLD); WP(2,4,CLD); WP(3,4,CLD); WP(4,4,CLD); WP(5,4,CLD); WP(6,4,CLD); WP(7,4,CLD);
+  }
+
+  #undef WP
 }
 
 // ============================================================
