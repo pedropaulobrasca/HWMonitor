@@ -1,16 +1,33 @@
 // ============================================================
-// HW Monitor v3 — Firmware para Lilygo T-Display-S3
+// HW Monitor v4 — Firmware para Lilygo T-Display-S3
 // ESP32-S3 + Display ST7789 1.9" (170x320)
+// WiFi provisioning via captive portal + NTP
 // Auto-switch: Idle (pixel art + clock) / Gaming (FPS + temps)
 // ============================================================
 
 #include <TFT_eSPI.h>
 #include <ArduinoJson.h>
+#include <WiFi.h>
+#include <WiFiManager.h>
+#include <time.h>
+
+// ── NTP ─────────────────────────────────────────────────────
+static const char* NTP_SERVER   = "pool.ntp.org";
+static const long  GMT_OFFSET   = -3 * 3600;  // BRT (Brasília) = UTC-3
+static const int   DST_OFFSET   = 0;
+
+// ── WiFi Manager ─────────────────────────────────────────────
+static const char* AP_NAME = "HWMonitor";
+WiFiManager wm;
 
 // ── Protótipos ──────────────────────────────────────────────
+void setupWiFi();
+void syncNTP();
+void updateNtpTime();
 void readSerial();
 void parseJson(const String &json);
-void drawOfflineScreen();
+void drawBootScreen(const char* msg);
+void drawConfigScreen();
 void drawIdleScreen();
 void drawGamingScreen();
 void drawCat(int x, int y, int scale, int frame);
@@ -37,10 +54,9 @@ static const uint16_t COL_RED      = 0xF800;
 static const uint16_t COL_SCANLINE = 0x0821;
 
 // Cores do gato
-static const uint16_t COL_CAT_BODY   = 0x7BEF;  // cinza
-static const uint16_t COL_CAT_DARK   = 0x4A49;  // cinza escuro (listras/orelhas)
-static const uint16_t COL_CAT_NOSE   = 0xFB2C;  // rosa
-static const uint16_t COL_CAT_EYE    = 0x07E0;  // verde
+static const uint16_t COL_CAT_BODY = 0x7BEF;
+static const uint16_t COL_CAT_DARK = 0x4A49;
+static const uint16_t COL_CAT_NOSE = 0xFB2C;
 
 // ── Dados recebidos ─────────────────────────────────────────
 struct HWData {
@@ -58,11 +74,10 @@ struct HWData {
 
 HWData hw;
 
-// ── Timeout ─────────────────────────────────────────────────
+// ── Estado da conexão serial ────────────────────────────────
 unsigned long lastDataTime = 0;
-static const unsigned long TIMEOUT_MS = 5000;
-bool isOffline  = true;
-bool wasOffline = true;
+static const unsigned long SERIAL_TIMEOUT_MS = 5000;
+bool hasSerialData = false;
 
 // ── Serial buffer ───────────────────────────────────────────
 String serialBuffer = "";
@@ -79,6 +94,14 @@ static const unsigned long GAMING_COOLDOWN_MS = 3000;
 unsigned long idleAnimTimer = 0;
 int idleFrame = 0;
 int zzzFrame  = 0;
+
+// ── NTP time ────────────────────────────────────────────────
+bool ntpSynced = false;
+unsigned long lastNtpUpdate = 0;
+static const unsigned long NTP_UPDATE_INTERVAL = 60000;  // atualiza a cada 60s
+
+// ── WiFi ────────────────────────────────────────────────────
+bool wifiConnected = false;
 
 // ============================================================
 // SETUP
@@ -100,43 +123,119 @@ void setup() {
   spr.createSprite(SCREEN_W, SCREEN_H);
   spr.setTextDatum(TL_DATUM);
 
+  // Boot screen: conectando WiFi
+  drawBootScreen("Conectando WiFi...");
+  setupWiFi();
+
+  if (wifiConnected) {
+    drawBootScreen("Sincronizando relogio...");
+    syncNTP();
+  } else {
+    drawConfigScreen();
+  }
+
   lastDataTime = millis();
-  drawOfflineScreen();
+}
+
+// ============================================================
+// WIFI (provisioning via captive portal)
+// ============================================================
+void setupWiFi() {
+  WiFi.mode(WIFI_STA);
+
+  wm.setConfigPortalBlocking(false);
+  wm.setConnectTimeout(10);
+  wm.setSaveConnectTimeout(10);
+
+  // Tenta conectar com credenciais salvas, senão abre portal
+  if (wm.autoConnect(AP_NAME)) {
+    wifiConnected = true;
+  } else {
+    // Portal aberto — AP "HWMonitor" no ar
+    wifiConnected = false;
+  }
+}
+
+// ============================================================
+// NTP
+// ============================================================
+void syncNTP() {
+  configTime(GMT_OFFSET, DST_OFFSET, NTP_SERVER);
+
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo, 5000)) {
+    ntpSynced = true;
+  }
+}
+
+void updateNtpTime() {
+  // Atualiza hora/data do NTP local (sem rede, struct tm é mantido pelo ESP32)
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo, 0)) {
+    strftime(hw.hora, sizeof(hw.hora), "%H:%M", &timeinfo);
+    strftime(hw.data, sizeof(hw.data), "%d %b", &timeinfo);
+  }
 }
 
 // ============================================================
 // LOOP
 // ============================================================
 void loop() {
+  // Se WiFi não conectou, processa o portal captive
+  if (!wifiConnected) {
+    wm.process();
+
+    // Checa se conectou agora
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiConnected = true;
+      drawBootScreen("Sincronizando relogio...");
+      syncNTP();
+    } else {
+      // Redesenha tela de config periodicamente (animação)
+      static unsigned long lastConfigDraw = 0;
+      if (millis() - lastConfigDraw > 500) {
+        lastConfigDraw = millis();
+        drawConfigScreen();
+      }
+      delay(50);
+      return;
+    }
+  }
+
+  // Reconecta WiFi se caiu
+  if (WiFi.status() != WL_CONNECTED) {
+    wifiConnected = false;
+    WiFi.reconnect();
+  }
+
   readSerial();
 
+  // Verifica se serial está ativa
+  bool serialActive = (millis() - lastDataTime < SERIAL_TIMEOUT_MS) && hasSerialData;
+
+  // Se não tem serial, usa hora do NTP
+  if (!serialActive && ntpSynced) {
+    if (millis() - lastNtpUpdate > NTP_UPDATE_INTERVAL) {
+      lastNtpUpdate = millis();
+      updateNtpTime();
+    }
+    // Atualiza hora a cada frame se não tem serial
+    updateNtpTime();
+  }
+
   // Auto-switch gaming/idle
-  if (hw.fps > 0) {
+  if (hw.fps > 0 && serialActive) {
     inGamingMode = true;
     lastFpsTime = millis();
   } else if (inGamingMode && (millis() - lastFpsTime > GAMING_COOLDOWN_MS)) {
     inGamingMode = false;
   }
 
-  // Timeout check
-  bool currentlyOffline = (millis() - lastDataTime > TIMEOUT_MS);
-
-  if (currentlyOffline && !wasOffline) {
-    isOffline = true;
-    drawOfflineScreen();
-    wasOffline = true;
-  } else if (!currentlyOffline && isOffline) {
-    isOffline  = false;
-    wasOffline = false;
-  }
-
-  if (!isOffline) {
-    if (inGamingMode) {
-      drawGamingScreen();
-    } else {
-      drawIdleScreen();
-    }
-    wasOffline = false;
+  // Sempre mostra algo: gaming ou idle (nunca "offline")
+  if (inGamingMode) {
+    drawGamingScreen();
+  } else {
+    drawIdleScreen();
   }
 
   delay(50);
@@ -176,47 +275,80 @@ void parseJson(const String &json) {
   hw.cpu_clk  = constrain(doc["cpu_clk"]  | 0, 0, 9999);
   hw.gpu_clk  = constrain(doc["gpu_clk"]  | 0, 0, 9999);
 
-  const char* t = doc["time"] | "--:--";
-  strncpy(hw.hora, t, sizeof(hw.hora) - 1);
-  hw.hora[sizeof(hw.hora) - 1] = '\0';
+  const char* t = doc["time"] | "";
+  if (strlen(t) > 0) {
+    strncpy(hw.hora, t, sizeof(hw.hora) - 1);
+    hw.hora[sizeof(hw.hora) - 1] = '\0';
+  }
 
   const char* d = doc["date"] | "";
-  strncpy(hw.data, d, sizeof(hw.data) - 1);
-  hw.data[sizeof(hw.data) - 1] = '\0';
+  if (strlen(d) > 0) {
+    strncpy(hw.data, d, sizeof(hw.data) - 1);
+    hw.data[sizeof(hw.data) - 1] = '\0';
+  }
 
   lastDataTime = millis();
-  isOffline    = false;
+  hasSerialData = true;
 }
 
 // ============================================================
-// TELA OFFLINE
+// BOOT SCREEN
 // ============================================================
-void drawOfflineScreen() {
+void drawBootScreen(const char* msg) {
   spr.fillSprite(COL_BG);
 
   int cx = SCREEN_W / 2;
-  int cy = SCREEN_H / 2 - 15;
-  for (int i = -2; i <= 2; i++) {
-    spr.drawLine(cx - 20 + i, cy - 20, cx + 20 + i, cy + 20, COL_RED);
-    spr.drawLine(cx + 20 + i, cy - 20, cx - 20 + i, cy + 20, COL_RED);
-  }
-  spr.drawCircle(cx, cy, 30, COL_DIM);
-
-  spr.setTextColor(COL_RED);
+  spr.setTextColor(COL_CYAN);
   spr.setTextSize(2);
   spr.setTextDatum(MC_DATUM);
-  spr.drawString("PC OFFLINE", cx, cy + 50);
+  spr.drawString("HW MON", cx, 60);
 
   spr.setTextColor(COL_DIM);
   spr.setTextSize(1);
-  spr.drawString("Aguardando conexao serial...", cx, cy + 70);
+  spr.drawString(msg, cx, 90);
 
   spr.setTextDatum(TL_DATUM);
   spr.pushSprite(0, 0);
 }
 
 // ============================================================
-// TELA IDLE — Pixel art cat + relógio
+// TELA CONFIG — Portal captive ativo, instrui o usuário
+// ============================================================
+void drawConfigScreen() {
+  spr.fillSprite(COL_BG);
+
+  int cx = SCREEN_W / 2;
+  spr.setTextDatum(MC_DATUM);
+
+  // Ícone WiFi piscando
+  uint8_t pulse = (millis() / 600) % 2;
+  spr.setTextColor(pulse ? COL_CYAN : COL_DIM);
+  spr.setTextSize(2);
+  spr.drawString("WiFi Setup", cx, 25);
+
+  // Instruções
+  spr.setTextColor(COL_TEXT);
+  spr.setTextSize(2);
+  spr.drawString("Conecte na rede:", cx, 58);
+
+  spr.setTextColor(COL_YELLOW);
+  spr.setTextSize(3);
+  spr.drawString(AP_NAME, cx, 88);
+
+  spr.setTextColor(COL_DIM);
+  spr.setTextSize(1);
+  spr.drawString("Abra o navegador em 192.168.4.1", cx, 118);
+  spr.drawString("e selecione sua rede WiFi", cx, 132);
+
+  // Bolinha animada
+  int dotX = cx - 15 + ((millis() / 300) % 3) * 15;
+  spr.fillCircle(dotX, 152, 3, COL_CYAN);
+
+  spr.pushSprite(0, 0);
+}
+
+// ============================================================
+// TELA IDLE — Pixel art cat + relógio (funciona sem PC!)
 // ============================================================
 void drawIdleScreen() {
   spr.fillSprite(COL_BG);
@@ -228,7 +360,7 @@ void drawIdleScreen() {
     zzzFrame  = (zzzFrame + 1) % 4;
   }
 
-  // ── Gato dormindo (esquerda da tela) ──
+  // ── Gato dormindo (esquerda) ──
   int catX = 20;
   int catY = 35;
   int scale = 4;
@@ -236,35 +368,48 @@ void drawIdleScreen() {
   drawZzz(catX + 14 * scale, catY - 4 * scale, zzzFrame);
 
   // ── Relógio grande (direita) ──
-  int clockX = 190;
+  int clockX = 225;
 
   spr.setTextColor(COL_TEXT);
   spr.setTextSize(5);
   spr.setTextDatum(MC_DATUM);
-  spr.drawString(hw.hora, clockX + 35, 70);
+  spr.drawString(hw.hora, clockX, 70);
 
   // Data abaixo
   if (strlen(hw.data) > 0) {
     spr.setTextColor(COL_DIM);
     spr.setTextSize(2);
-    spr.drawString(hw.data, clockX + 35, 105);
+    spr.drawString(hw.data, clockX, 105);
   }
 
-  // ── Info sutil no rodapé ──
+  // ── Rodapé: info do PC (se disponível) ou status WiFi ──
+  bool serialActive = (millis() - lastDataTime < SERIAL_TIMEOUT_MS) && hasSerialData;
+
   spr.setTextColor(COL_DIM);
   spr.setTextSize(1);
-  spr.setTextDatum(BL_DATUM);
 
-  char infoBuf[32];
-  snprintf(infoBuf, sizeof(infoBuf), "CPU %d%%  RAM %d%%", hw.cpu, hw.ram);
-  spr.drawString(infoBuf, 8, SCREEN_H - 4);
+  if (serialActive) {
+    char infoBuf[32];
+    snprintf(infoBuf, sizeof(infoBuf), "CPU %d%%  RAM %d%%", hw.cpu, hw.ram);
+    spr.setTextDatum(BL_DATUM);
+    spr.drawString(infoBuf, 8, SCREEN_H - 4);
 
-  if (hw.cpu_temp > 0 || hw.gpu_temp > 0) {
-    char tempBuf[32];
-    snprintf(tempBuf, sizeof(tempBuf), "%d%sC / %d%sC",
-             hw.cpu_temp, "\xB0", hw.gpu_temp, "\xB0");
+    if (hw.cpu_temp > 0 || hw.gpu_temp > 0) {
+      char tempBuf[32];
+      snprintf(tempBuf, sizeof(tempBuf), "%d%sC / %d%sC",
+               hw.cpu_temp, "\xB0", hw.gpu_temp, "\xB0");
+      spr.setTextDatum(BR_DATUM);
+      spr.drawString(tempBuf, SCREEN_W - 8, SCREEN_H - 4);
+    }
+  } else {
+    // Sem serial: mostra status WiFi
     spr.setTextDatum(BR_DATUM);
-    spr.drawString(tempBuf, SCREEN_W - 8, SCREEN_H - 4);
+    if (wifiConnected) {
+      spr.drawString("WiFi OK", SCREEN_W - 8, SCREEN_H - 4);
+    } else {
+      spr.setTextColor(COL_RED);
+      spr.drawString("WiFi OFF", SCREEN_W - 8, SCREEN_H - 4);
+    }
   }
 
   spr.pushSprite(0, 0);
@@ -272,61 +417,57 @@ void drawIdleScreen() {
 
 // ============================================================
 // GATO PIXEL ART — "cat loaf" dormindo, vista lateral
-// Grid: ~20 wide x 13 tall, escala = s pixels por pixel-art
-// Frame 0: normal, Frame 1: respiração (corpo sobe 1px)
 // ============================================================
 void drawCat(int ox, int oy, int s, int frame) {
-  int b = (frame == 1) ? -s : 0;  // breath offset
+  int b = (frame == 1) ? -s : 0;
 
   #define PX(x, y, col)  spr.fillRect(ox + (x)*s, oy + (y)*s, s, s, col)
   #define PXB(x, y, col) spr.fillRect(ox + (x)*s, oy + (y)*s + b, s, s, col)
 
-  // ── Orelhas (juntas no topo, triângulo) ──
-  PX(3, 0, COL_CAT_DARK);                          // orelha esq ponta
-  PX(6, 0, COL_CAT_DARK);                          // orelha dir ponta
-  PX(2, 1, COL_CAT_DARK); PX(3, 1, COL_CAT_BODY); PX(4, 1, COL_CAT_DARK);  // orelha esq
-  PX(5, 1, COL_CAT_DARK); PX(6, 1, COL_CAT_BODY); PX(7, 1, COL_CAT_DARK);  // orelha dir
+  // ── Orelhas ──
+  PX(3, 0, COL_CAT_DARK);
+  PX(6, 0, COL_CAT_DARK);
+  PX(2, 1, COL_CAT_DARK); PX(3, 1, COL_CAT_BODY); PX(4, 1, COL_CAT_DARK);
+  PX(5, 1, COL_CAT_DARK); PX(6, 1, COL_CAT_BODY); PX(7, 1, COL_CAT_DARK);
 
-  // ── Cabeça (respira) ──
-  for (int x = 1; x <= 8; x++) PXB(x, 2, COL_CAT_BODY);   // topo cabeça
-  for (int x = 0; x <= 9; x++) PXB(x, 3, COL_CAT_BODY);   // meio cabeça
-  for (int x = 0; x <= 9; x++) PXB(x, 4, COL_CAT_BODY);   // meio cabeça
-  for (int x = 1; x <= 8; x++) PXB(x, 5, COL_CAT_BODY);   // queixo
+  // ── Cabeça ──
+  for (int x = 1; x <= 8; x++) PXB(x, 2, COL_CAT_BODY);
+  for (int x = 0; x <= 9; x++) PXB(x, 3, COL_CAT_BODY);
+  for (int x = 0; x <= 9; x++) PXB(x, 4, COL_CAT_BODY);
+  for (int x = 1; x <= 8; x++) PXB(x, 5, COL_CAT_BODY);
 
-  // Olhos fechados (arcos curvos ── )
-  PXB(2, 3, COL_CAT_DARK); PXB(3, 3, COL_CAT_DARK);       // olho esq
-  PXB(6, 3, COL_CAT_DARK); PXB(7, 3, COL_CAT_DARK);       // olho dir
+  // Olhos fechados
+  PXB(2, 3, COL_CAT_DARK); PXB(3, 3, COL_CAT_DARK);
+  PXB(6, 3, COL_CAT_DARK); PXB(7, 3, COL_CAT_DARK);
 
   // Nariz + boca
-  PXB(4, 4, COL_CAT_NOSE); PXB(5, 4, COL_CAT_NOSE);       // nariz rosa
-  PXB(3, 5, COL_CAT_DARK); PXB(6, 5, COL_CAT_DARK);       // boca
+  PXB(4, 4, COL_CAT_NOSE); PXB(5, 4, COL_CAT_NOSE);
+  PXB(3, 5, COL_CAT_DARK); PXB(6, 5, COL_CAT_DARK);
 
   // Bigodes
-  PXB(0, 3, COL_CAT_DARK);                                  // bigode esq
-  PXB(9, 3, COL_CAT_DARK);                                  // bigode dir
-  PXB(0, 4, COL_CAT_DARK);                                  // bigode esq baixo
-  PXB(9, 4, COL_CAT_DARK);                                  // bigode dir baixo
+  PXB(0, 3, COL_CAT_DARK); PXB(9, 3, COL_CAT_DARK);
+  PXB(0, 4, COL_CAT_DARK); PXB(9, 4, COL_CAT_DARK);
 
-  // ── Corpo (largo, achatado — "cat loaf") ──
+  // ── Corpo ──
   for (int x = 0; x <= 15; x++) PXB(x, 6, COL_CAT_BODY);
   for (int x = 0; x <= 16; x++) PXB(x, 7, COL_CAT_BODY);
   for (int x = 0; x <= 16; x++) PXB(x, 8, COL_CAT_BODY);
   for (int x = 0; x <= 16; x++) PXB(x, 9, COL_CAT_BODY);
   for (int x = 1; x <= 15; x++) PXB(x, 10, COL_CAT_BODY);
 
-  // Listras no corpo
+  // Listras
   PXB(5, 7, COL_CAT_DARK);  PXB(9, 7, COL_CAT_DARK);  PXB(13, 7, COL_CAT_DARK);
   PXB(5, 8, COL_CAT_DARK);  PXB(9, 8, COL_CAT_DARK);  PXB(13, 8, COL_CAT_DARK);
 
-  // ── Patinhas da frente (dobradas, descansando) ──
+  // ── Patinhas ──
   PX(1, 11, COL_CAT_BODY); PX(2, 11, COL_CAT_BODY); PX(3, 11, COL_CAT_BODY);
 
-  // ── Rabo (curva elegante pra cima, saindo de trás) ──
+  // ── Rabo ──
   PXB(16, 9, COL_CAT_DARK);
   PX(17, 8, COL_CAT_DARK);
   PX(18, 7, COL_CAT_DARK);
   PX(18, 6, COL_CAT_DARK);
-  PX(17, 5, COL_CAT_DARK);  // ponta do rabo curvando
+  PX(17, 5, COL_CAT_DARK);
 
   #undef PX
   #undef PXB
@@ -336,8 +477,7 @@ void drawCat(int ox, int oy, int s, int frame) {
 // ZZZ FLUTUANTE
 // ============================================================
 void drawZzz(int ox, int oy, int frame) {
-  // 3 "z"s em posições que flutuam
-  int offsets[] = {0, -3, -6, -3};  // oscilação vertical
+  int offsets[] = {0, -3, -6, -3};
   int yOff = offsets[frame];
 
   spr.setTextColor(COL_DIM);
