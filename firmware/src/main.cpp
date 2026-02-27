@@ -1,57 +1,46 @@
 // ============================================================
-// HW Monitor v2 — Firmware para Lilygo T-Display-S3
+// HW Monitor v3 — Firmware para Lilygo T-Display-S3
 // ESP32-S3 + Display ST7789 1.9" (170x320)
-// Comunicação Serial USB 115200 baud
-// Bibliotecas: TFT_eSPI, ArduinoJson
-// Multi-tela com botão GPIO 14
+// Auto-switch: Idle (pixel art + clock) / Gaming (FPS + temps)
 // ============================================================
 
 #include <TFT_eSPI.h>
 #include <ArduinoJson.h>
 
-// ── Protótipos de funções ───────────────────────────────────
+// ── Protótipos ──────────────────────────────────────────────
 void readSerial();
 void parseJson(const String &json);
 void drawOfflineScreen();
-void drawScreen1();
-void drawScreen2();
-void drawScreen3();
-void drawHeader(const char* title);
-void drawMetric(const char* label, int value, int x, int y,
-                int w, int h, uint16_t color, const char* unit);
-void drawScanlineEffect();
-void drawPageIndicator();
+void drawIdleScreen();
+void drawGamingScreen();
+void drawCat(int x, int y, int scale, int frame);
+void drawZzz(int x, int y, int frame);
 uint16_t lightenColor(uint16_t color);
-void IRAM_ATTR onButtonPress();
 
-// ── Configuração do Display ─────────────────────────────────
+// ── Display ─────────────────────────────────────────────────
 TFT_eSPI    tft = TFT_eSPI();
-TFT_eSprite spr = TFT_eSprite(&tft);  // Double buffering
+TFT_eSprite spr = TFT_eSprite(&tft);
 
-// ── Dimensões da tela (landscape) ───────────────────────────
 static const int SCREEN_W = 320;
 static const int SCREEN_H = 170;
 
-// ── Botão ───────────────────────────────────────────────────
-static const int BTN_PIN = 14;
-volatile bool btnPressed = false;
-unsigned long lastBtnTime = 0;
-static const unsigned long DEBOUNCE_MS = 250;
-int currentScreen = 0;
-static const int NUM_SCREENS = 3;
+// ── Paleta (RGB565) ─────────────────────────────────────────
+static const uint16_t COL_BG       = TFT_BLACK;
+static const uint16_t COL_CYAN     = 0x07FF;
+static const uint16_t COL_MAGENTA  = 0xF81F;
+static const uint16_t COL_GREEN    = 0x07E0;
+static const uint16_t COL_ORANGE   = 0xFDA0;
+static const uint16_t COL_YELLOW   = 0xFFE0;
+static const uint16_t COL_TEXT     = 0xFFFF;
+static const uint16_t COL_DIM      = 0x7BEF;
+static const uint16_t COL_RED      = 0xF800;
+static const uint16_t COL_SCANLINE = 0x0821;
 
-// ── Paleta de cores (RGB565) ────────────────────────────────
-static const uint16_t COL_BG        = TFT_BLACK;
-static const uint16_t COL_CYAN      = 0x07FF;  // CPU
-static const uint16_t COL_MAGENTA   = 0xF81F;  // GPU
-static const uint16_t COL_GREEN     = 0x07E0;  // RAM
-static const uint16_t COL_ORANGE    = 0xFDA0;  // TEMP
-static const uint16_t COL_YELLOW    = 0xFFE0;  // FPS
-static const uint16_t COL_BAR_BG    = 0x2104;  // cinza escuro
-static const uint16_t COL_TEXT      = 0xFFFF;
-static const uint16_t COL_DIM       = 0x7BEF;  // cinza médio
-static const uint16_t COL_RED       = 0xF800;
-static const uint16_t COL_SCANLINE  = 0x0821;  // verde escuro sutil
+// Cores do gato
+static const uint16_t COL_CAT_BODY   = 0x7BEF;  // cinza
+static const uint16_t COL_CAT_DARK   = 0x4A49;  // cinza escuro (listras/orelhas)
+static const uint16_t COL_CAT_NOSE   = 0xFB2C;  // rosa
+static const uint16_t COL_CAT_EYE    = 0x07E0;  // verde
 
 // ── Dados recebidos ─────────────────────────────────────────
 struct HWData {
@@ -63,28 +52,33 @@ struct HWData {
   int fps      = 0;
   int cpu_clk  = 0;
   int gpu_clk  = 0;
-  char hora[6] = "--:--";
+  char hora[6]  = "--:--";
+  char data[12] = "";
 };
 
 HWData hw;
 
-// ── Controle de timeout ─────────────────────────────────────
-unsigned long lastDataTime   = 0;
+// ── Timeout ─────────────────────────────────────────────────
+unsigned long lastDataTime = 0;
 static const unsigned long TIMEOUT_MS = 5000;
-bool isOffline               = true;
-bool wasOffline              = true;  // força primeiro desenho
+bool isOffline  = true;
+bool wasOffline = true;
 
-// ── Buffer serial ───────────────────────────────────────────
+// ── Serial buffer ───────────────────────────────────────────
 String serialBuffer = "";
 
-// ── Efeito scanline (ativado quando temp > 80) ──────────────
-bool scanlineActive = false;
-int  scanlineOffset = 0;
+// ── Scanline ────────────────────────────────────────────────
+int scanlineOffset = 0;
 
-// ── ISR do botão ────────────────────────────────────────────
-void IRAM_ATTR onButtonPress() {
-  btnPressed = true;
-}
+// ── Gaming mode cooldown ────────────────────────────────────
+bool inGamingMode = false;
+unsigned long lastFpsTime = 0;
+static const unsigned long GAMING_COOLDOWN_MS = 3000;
+
+// ── Animação idle ───────────────────────────────────────────
+unsigned long idleAnimTimer = 0;
+int idleFrame = 0;
+int zzzFrame  = 0;
 
 // ============================================================
 // SETUP
@@ -92,24 +86,17 @@ void IRAM_ATTR onButtonPress() {
 void setup() {
   Serial.begin(115200);
 
-  // T-Display-S3: habilitar energia do display (GPIO 15)
   pinMode(15, OUTPUT);
   digitalWrite(15, HIGH);
 
   tft.init();
-  tft.setRotation(1);  // landscape
+  tft.setRotation(1);
 
-  // Backlight ON (GPIO 38)
   pinMode(38, OUTPUT);
   digitalWrite(38, HIGH);
 
-  // Botão direito (GPIO 14) com pull-up interno
-  pinMode(BTN_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(BTN_PIN), onButtonPress, FALLING);
-
   tft.fillScreen(COL_BG);
 
-  // Criar sprite do tamanho total da tela (double buffer)
   spr.createSprite(SCREEN_W, SCREEN_H);
   spr.setTextDatum(TL_DATUM);
 
@@ -118,23 +105,20 @@ void setup() {
 }
 
 // ============================================================
-// LOOP PRINCIPAL
+// LOOP
 // ============================================================
 void loop() {
-  // Lê dados da serial
   readSerial();
 
-  // Verifica botão com debounce
-  if (btnPressed) {
-    unsigned long now = millis();
-    if (now - lastBtnTime > DEBOUNCE_MS) {
-      currentScreen = (currentScreen + 1) % NUM_SCREENS;
-      lastBtnTime = now;
-    }
-    btnPressed = false;
+  // Auto-switch gaming/idle
+  if (hw.fps > 0) {
+    inGamingMode = true;
+    lastFpsTime = millis();
+  } else if (inGamingMode && (millis() - lastFpsTime > GAMING_COOLDOWN_MS)) {
+    inGamingMode = false;
   }
 
-  // Verifica timeout
+  // Timeout check
   bool currentlyOffline = (millis() - lastDataTime > TIMEOUT_MS);
 
   if (currentlyOffline && !wasOffline) {
@@ -147,21 +131,19 @@ void loop() {
   }
 
   if (!isOffline) {
-    if (currentScreen == 0) {
-      drawScreen1();
-    } else if (currentScreen == 1) {
-      drawScreen2();
+    if (inGamingMode) {
+      drawGamingScreen();
     } else {
-      drawScreen3();
+      drawIdleScreen();
     }
     wasOffline = false;
   }
 
-  delay(50);  // ~20 FPS
+  delay(50);
 }
 
 // ============================================================
-// LEITURA SERIAL + PARSE JSON
+// SERIAL + JSON
 // ============================================================
 void readSerial() {
   while (Serial.available()) {
@@ -173,7 +155,6 @@ void readSerial() {
       }
     } else {
       serialBuffer += c;
-      // Proteção contra overflow
       if (serialBuffer.length() > 512) {
         serialBuffer = "";
       }
@@ -182,10 +163,9 @@ void readSerial() {
 }
 
 void parseJson(const String &json) {
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<384> doc;
   DeserializationError err = deserializeJson(doc, json);
-
-  if (err) return;  // ignora JSON inválido
+  if (err) return;
 
   hw.cpu      = constrain(doc["cpu"]      | 0, 0, 100);
   hw.gpu      = constrain(doc["gpu"]      | 0, 0, 100);
@@ -200,6 +180,10 @@ void parseJson(const String &json) {
   strncpy(hw.hora, t, sizeof(hw.hora) - 1);
   hw.hora[sizeof(hw.hora) - 1] = '\0';
 
+  const char* d = doc["date"] | "";
+  strncpy(hw.data, d, sizeof(hw.data) - 1);
+  hw.data[sizeof(hw.data) - 1] = '\0';
+
   lastDataTime = millis();
   isOffline    = false;
 }
@@ -210,18 +194,14 @@ void parseJson(const String &json) {
 void drawOfflineScreen() {
   spr.fillSprite(COL_BG);
 
-  // Ícone de desconexão (X grande)
   int cx = SCREEN_W / 2;
   int cy = SCREEN_H / 2 - 15;
   for (int i = -2; i <= 2; i++) {
     spr.drawLine(cx - 20 + i, cy - 20, cx + 20 + i, cy + 20, COL_RED);
     spr.drawLine(cx + 20 + i, cy - 20, cx - 20 + i, cy + 20, COL_RED);
   }
-
-  // Círculo ao redor
   spr.drawCircle(cx, cy, 30, COL_DIM);
 
-  // Texto
   spr.setTextColor(COL_RED);
   spr.setTextSize(2);
   spr.setTextDatum(MC_DATUM);
@@ -236,300 +216,207 @@ void drawOfflineScreen() {
 }
 
 // ============================================================
-// TELA 1 — Dashboard Principal
+// TELA IDLE — Pixel art cat + relógio
 // ============================================================
-void drawScreen1() {
+void drawIdleScreen() {
   spr.fillSprite(COL_BG);
 
-  drawHeader("HW MON");
+  // Avança animação a cada 800ms
+  if (millis() - idleAnimTimer > 800) {
+    idleAnimTimer = millis();
+    idleFrame = (idleFrame + 1) % 2;
+    zzzFrame  = (zzzFrame + 1) % 4;
+  }
 
-  int barX = 70;
-  int barW = 175;
-  int barH = 16;
-  int startY = 36;
-  int spacing = 24;
+  // ── Gato dormindo (esquerda da tela) ──
+  int catX = 20;
+  int catY = 35;
+  int scale = 4;
+  drawCat(catX, catY, scale, idleFrame);
+  drawZzz(catX + 14 * scale, catY - 4 * scale, zzzFrame);
 
-  drawMetric("CPU",  hw.cpu,  barX, startY,              barW, barH, COL_CYAN,    "%");
-  drawMetric("GPU",  hw.gpu,  barX, startY + spacing,     barW, barH, COL_MAGENTA, "%");
-  drawMetric("RAM",  hw.ram,  barX, startY + spacing * 2, barW, barH, COL_GREEN,   "%");
+  // ── Relógio grande (direita) ──
+  int clockX = 190;
 
-  // FPS — número grande e destacado
-  int fpsY = startY + spacing * 3 + 2;
-  spr.setTextColor(COL_YELLOW);
-  spr.setTextSize(1);
-  spr.setTextDatum(MR_DATUM);
-  spr.drawString("FPS", barX - 8, fpsY + 8);
+  spr.setTextColor(COL_TEXT);
+  spr.setTextSize(5);
+  spr.setTextDatum(MC_DATUM);
+  spr.drawString(hw.hora, clockX + 35, 70);
 
-  if (hw.fps > 0) {
-    char fpsBuf[8];
-    snprintf(fpsBuf, sizeof(fpsBuf), "%d", hw.fps);
-    spr.setTextColor(COL_YELLOW);
-    spr.setTextSize(3);
-    spr.setTextDatum(ML_DATUM);
-    spr.drawString(fpsBuf, barX, fpsY - 2);
-  } else {
+  // Data abaixo
+  if (strlen(hw.data) > 0) {
     spr.setTextColor(COL_DIM);
     spr.setTextSize(2);
-    spr.setTextDatum(ML_DATUM);
-    spr.drawString("---", barX, fpsY);
+    spr.drawString(hw.data, clockX + 35, 105);
   }
 
-  // Scanline quando cpu_temp ou gpu_temp > 80
-  int maxTemp = max(hw.cpu_temp, hw.gpu_temp);
-  scanlineActive = (maxTemp > 80);
-  if (scanlineActive) {
-    drawScanlineEffect();
-  }
-
-  drawPageIndicator();
-  spr.pushSprite(0, 0);
-}
-
-// ============================================================
-// TELA 2 — Temperaturas & Detalhes
-// ============================================================
-void drawScreen2() {
-  spr.fillSprite(COL_BG);
-
-  drawHeader("TEMPS & INFO");
-
-  int barX = 90;
-  int barW = 170;
-  int barH = 16;
-  int startY = 36;
-  int spacing = 24;
-
-  drawMetric("CPU T", hw.cpu_temp, barX, startY,           barW, barH, COL_CYAN,   "C");
-  drawMetric("GPU T", hw.gpu_temp, barX, startY + spacing,  barW, barH, COL_MAGENTA,"C");
-
-  // CPU Clock
-  int lineY = startY + spacing * 2 + 4;
-  char clkBuf[16];
-
-  spr.setTextColor(COL_CYAN);
-  spr.setTextSize(1);
-  spr.setTextDatum(TL_DATUM);
-  spr.drawString("CPU CLK", 10, lineY);
-  snprintf(clkBuf, sizeof(clkBuf), "%d MHz", hw.cpu_clk);
-  spr.setTextColor(COL_TEXT);
-  spr.setTextDatum(TR_DATUM);
-  spr.drawString(clkBuf, SCREEN_W - 10, lineY);
-
-  // GPU Clock
-  lineY += 18;
-  spr.setTextColor(COL_MAGENTA);
-  spr.setTextDatum(TL_DATUM);
-  spr.drawString("GPU CLK", 10, lineY);
-  snprintf(clkBuf, sizeof(clkBuf), "%d MHz", hw.gpu_clk);
-  spr.setTextColor(COL_TEXT);
-  spr.setTextDatum(TR_DATUM);
-  spr.drawString(clkBuf, SCREEN_W - 10, lineY);
-
-  // Hardware info na parte inferior
-  lineY += 22;
+  // ── Info sutil no rodapé ──
   spr.setTextColor(COL_DIM);
   spr.setTextSize(1);
-  spr.setTextDatum(TL_DATUM);
-  spr.drawString("i5-12400F / RX 9060 XT", 10, lineY);
+  spr.setTextDatum(BL_DATUM);
 
-  // Scanline quando temp > 80
-  int maxTemp = max(hw.cpu_temp, hw.gpu_temp);
-  scanlineActive = (maxTemp > 80);
-  if (scanlineActive) {
-    drawScanlineEffect();
+  char infoBuf[32];
+  snprintf(infoBuf, sizeof(infoBuf), "CPU %d%%  RAM %d%%", hw.cpu, hw.ram);
+  spr.drawString(infoBuf, 8, SCREEN_H - 4);
+
+  if (hw.cpu_temp > 0 || hw.gpu_temp > 0) {
+    char tempBuf[32];
+    snprintf(tempBuf, sizeof(tempBuf), "%d%sC / %d%sC",
+             hw.cpu_temp, "\xB0", hw.gpu_temp, "\xB0");
+    spr.setTextDatum(BR_DATUM);
+    spr.drawString(tempBuf, SCREEN_W - 8, SCREEN_H - 4);
   }
 
-  drawPageIndicator();
   spr.pushSprite(0, 0);
 }
 
 // ============================================================
-// TELA 3 — Gaming (FPS grande + temps)
+// GATO PIXEL ART — "cat loaf" dormindo, vista lateral
+// Grid: ~20 wide x 13 tall, escala = s pixels por pixel-art
+// Frame 0: normal, Frame 1: respiração (corpo sobe 1px)
 // ============================================================
-void drawScreen3() {
+void drawCat(int ox, int oy, int s, int frame) {
+  int b = (frame == 1) ? -s : 0;  // breath offset
+
+  #define PX(x, y, col)  spr.fillRect(ox + (x)*s, oy + (y)*s, s, s, col)
+  #define PXB(x, y, col) spr.fillRect(ox + (x)*s, oy + (y)*s + b, s, s, col)
+
+  // ── Orelhas (juntas no topo, triângulo) ──
+  PX(3, 0, COL_CAT_DARK);                          // orelha esq ponta
+  PX(6, 0, COL_CAT_DARK);                          // orelha dir ponta
+  PX(2, 1, COL_CAT_DARK); PX(3, 1, COL_CAT_BODY); PX(4, 1, COL_CAT_DARK);  // orelha esq
+  PX(5, 1, COL_CAT_DARK); PX(6, 1, COL_CAT_BODY); PX(7, 1, COL_CAT_DARK);  // orelha dir
+
+  // ── Cabeça (respira) ──
+  for (int x = 1; x <= 8; x++) PXB(x, 2, COL_CAT_BODY);   // topo cabeça
+  for (int x = 0; x <= 9; x++) PXB(x, 3, COL_CAT_BODY);   // meio cabeça
+  for (int x = 0; x <= 9; x++) PXB(x, 4, COL_CAT_BODY);   // meio cabeça
+  for (int x = 1; x <= 8; x++) PXB(x, 5, COL_CAT_BODY);   // queixo
+
+  // Olhos fechados (arcos curvos ── )
+  PXB(2, 3, COL_CAT_DARK); PXB(3, 3, COL_CAT_DARK);       // olho esq
+  PXB(6, 3, COL_CAT_DARK); PXB(7, 3, COL_CAT_DARK);       // olho dir
+
+  // Nariz + boca
+  PXB(4, 4, COL_CAT_NOSE); PXB(5, 4, COL_CAT_NOSE);       // nariz rosa
+  PXB(3, 5, COL_CAT_DARK); PXB(6, 5, COL_CAT_DARK);       // boca
+
+  // Bigodes
+  PXB(0, 3, COL_CAT_DARK);                                  // bigode esq
+  PXB(9, 3, COL_CAT_DARK);                                  // bigode dir
+  PXB(0, 4, COL_CAT_DARK);                                  // bigode esq baixo
+  PXB(9, 4, COL_CAT_DARK);                                  // bigode dir baixo
+
+  // ── Corpo (largo, achatado — "cat loaf") ──
+  for (int x = 0; x <= 15; x++) PXB(x, 6, COL_CAT_BODY);
+  for (int x = 0; x <= 16; x++) PXB(x, 7, COL_CAT_BODY);
+  for (int x = 0; x <= 16; x++) PXB(x, 8, COL_CAT_BODY);
+  for (int x = 0; x <= 16; x++) PXB(x, 9, COL_CAT_BODY);
+  for (int x = 1; x <= 15; x++) PXB(x, 10, COL_CAT_BODY);
+
+  // Listras no corpo
+  PXB(5, 7, COL_CAT_DARK);  PXB(9, 7, COL_CAT_DARK);  PXB(13, 7, COL_CAT_DARK);
+  PXB(5, 8, COL_CAT_DARK);  PXB(9, 8, COL_CAT_DARK);  PXB(13, 8, COL_CAT_DARK);
+
+  // ── Patinhas da frente (dobradas, descansando) ──
+  PX(1, 11, COL_CAT_BODY); PX(2, 11, COL_CAT_BODY); PX(3, 11, COL_CAT_BODY);
+
+  // ── Rabo (curva elegante pra cima, saindo de trás) ──
+  PXB(16, 9, COL_CAT_DARK);
+  PX(17, 8, COL_CAT_DARK);
+  PX(18, 7, COL_CAT_DARK);
+  PX(18, 6, COL_CAT_DARK);
+  PX(17, 5, COL_CAT_DARK);  // ponta do rabo curvando
+
+  #undef PX
+  #undef PXB
+}
+
+// ============================================================
+// ZZZ FLUTUANTE
+// ============================================================
+void drawZzz(int ox, int oy, int frame) {
+  // 3 "z"s em posições que flutuam
+  int offsets[] = {0, -3, -6, -3};  // oscilação vertical
+  int yOff = offsets[frame];
+
+  spr.setTextColor(COL_DIM);
+  spr.setTextDatum(TL_DATUM);
+
+  spr.setTextSize(1);
+  spr.drawString("z", ox, oy + yOff + 12);
+
+  spr.setTextSize(1);
+  spr.drawString("z", ox + 8, oy + yOff + 4);
+
+  spr.setTextSize(2);
+  spr.drawString("Z", ox + 16, oy + yOff - 6);
+}
+
+// ============================================================
+// TELA GAMING — FPS grande + temps
+// ============================================================
+void drawGamingScreen() {
   spr.fillSprite(COL_BG);
 
-  drawHeader("GAMING");
+  // ── Header ──
+  spr.drawFastHLine(0, 0, SCREEN_W, COL_DIM);
 
+  spr.setTextSize(2);
+  spr.setTextDatum(TL_DATUM);
+  spr.setTextColor(COL_ORANGE);
+  spr.drawString("GAMING", 8, 8);
+
+  spr.setTextColor(COL_TEXT);
+  spr.setTextDatum(TR_DATUM);
+  spr.drawString(hw.hora, SCREEN_W - 28, 8);
+
+  uint8_t pulse = (millis() / 500) % 2;
+  spr.fillCircle(SCREEN_W - 10, 15, 5, pulse ? COL_GREEN : 0x03E0);
+
+  spr.drawFastHLine(0, 30, SCREEN_W, COL_DIM);
+
+  // ── FPS gigante ──
   int cx = SCREEN_W / 2;
 
   if (hw.fps > 0) {
-    // FPS gigante centralizado
     char fpsBuf[8];
     snprintf(fpsBuf, sizeof(fpsBuf), "%d", hw.fps);
     spr.setTextColor(COL_YELLOW);
     spr.setTextSize(7);
     spr.setTextDatum(MC_DATUM);
-    spr.drawString(fpsBuf, cx, 80);
+    spr.drawString(fpsBuf, cx, 78);
 
-    // Label "FPS" abaixo do número
     spr.setTextColor(COL_DIM);
     spr.setTextSize(2);
-    spr.drawString("FPS", cx, 115);
-  } else {
-    spr.setTextColor(COL_DIM);
-    spr.setTextSize(4);
-    spr.setTextDatum(MC_DATUM);
-    spr.drawString("---", cx, 80);
-
-    spr.setTextSize(1);
-    spr.drawString("RTSS nao detectado", cx, 110);
+    spr.drawString("FPS", cx, 113);
   }
 
-  // Temps na parte inferior
+  // ── Temps embaixo ──
   char tempBuf[16];
   int tempY = SCREEN_H - 20;
 
-  // CPU temp à esquerda
   spr.setTextColor(COL_CYAN);
   spr.setTextSize(2);
   spr.setTextDatum(BL_DATUM);
   snprintf(tempBuf, sizeof(tempBuf), "CPU %d%sC", hw.cpu_temp, "\xB0");
   spr.drawString(tempBuf, 10, tempY);
 
-  // GPU temp à direita
   spr.setTextColor(COL_MAGENTA);
   spr.setTextDatum(BR_DATUM);
   snprintf(tempBuf, sizeof(tempBuf), "GPU %d%sC", hw.gpu_temp, "\xB0");
   spr.drawString(tempBuf, SCREEN_W - 10, tempY);
 
-  // Scanline quando temp > 80
+  // ── Scanline quando temp > 80 ──
   int maxTemp = max(hw.cpu_temp, hw.gpu_temp);
-  scanlineActive = (maxTemp > 80);
-  if (scanlineActive) {
-    drawScanlineEffect();
+  if (maxTemp > 80) {
+    scanlineOffset = (scanlineOffset + 1) % 4;
+    for (int y = scanlineOffset; y < SCREEN_H; y += 4) {
+      spr.drawFastHLine(0, y, SCREEN_W, COL_SCANLINE);
+    }
   }
 
-  drawPageIndicator();
   spr.pushSprite(0, 0);
-}
-
-// ============================================================
-// HEADER
-// ============================================================
-void drawHeader(const char* title) {
-  // Linha decorativa superior
-  spr.drawFastHLine(0, 0, SCREEN_W, COL_DIM);
-
-  // Título
-  spr.setTextSize(2);
-  spr.setTextDatum(TL_DATUM);
-
-  if (strcmp(title, "HW MON") == 0) {
-    spr.setTextColor(COL_CYAN);
-    spr.drawString("HW", 8, 8);
-    spr.setTextColor(COL_MAGENTA);
-    spr.drawString("MON", 38, 8);
-  } else {
-    spr.setTextColor(COL_ORANGE);
-    spr.drawString(title, 8, 8);
-  }
-
-  // Horário
-  spr.setTextColor(COL_TEXT);
-  spr.setTextSize(2);
-  spr.setTextDatum(TR_DATUM);
-  spr.drawString(hw.hora, SCREEN_W - 28, 8);
-
-  // Indicador de status (bolinha verde pulsante)
-  uint8_t pulse = (millis() / 500) % 2;
-  spr.fillCircle(SCREEN_W - 10, 15, 5, pulse ? COL_GREEN : 0x03E0);
-
-  // Linha separadora
-  spr.drawFastHLine(0, 30, SCREEN_W, COL_DIM);
-}
-
-// ============================================================
-// MÉTRICA COM BARRA DE PROGRESSO
-// ============================================================
-void drawMetric(const char* label, int value, int x, int y,
-                int w, int h, uint16_t color, const char* unit) {
-
-  // Label à esquerda
-  spr.setTextColor(color);
-  spr.setTextSize(1);
-  spr.setTextDatum(MR_DATUM);
-  spr.drawString(label, x - 8, y + h / 2);
-
-  // Fundo da barra
-  spr.fillRoundRect(x, y, w, h, 3, COL_BAR_BG);
-
-  // Cálculo do preenchimento
-  int fillW = 0;
-  if (strcmp(unit, "C") == 0) {
-    fillW = map(constrain(value, 0, 100), 0, 100, 0, w);
-  } else {
-    fillW = map(value, 0, 100, 0, w);
-  }
-
-  if (fillW > 0) {
-    spr.fillRoundRect(x, y, fillW, h, 3, color);
-
-    // Highlight no topo da barra (efeito 3D)
-    uint16_t lighter = lightenColor(color);
-    spr.drawFastHLine(x + 2, y + 1, fillW - 4, lighter);
-  }
-
-  // Valor numérico à direita da barra
-  char buf[12];
-  if (strcmp(unit, "C") == 0) {
-    snprintf(buf, sizeof(buf), "%d%sC", value, "\xB0");
-  } else {
-    snprintf(buf, sizeof(buf), "%d%%", value);
-  }
-
-  spr.setTextColor(COL_TEXT);
-  spr.setTextSize(1);
-  spr.setTextDatum(ML_DATUM);
-  spr.drawString(buf, x + w + 6, y + h / 2);
-
-  // Indicador de alerta quando valor > 90
-  if (value > 90) {
-    if ((millis() / 300) % 2) {
-      spr.fillCircle(x - 20, y + h / 2, 3, COL_RED);
-    }
-  }
-}
-
-// ============================================================
-// EFEITO SCANLINE (quando temp > 80°C)
-// ============================================================
-void drawScanlineEffect() {
-  scanlineOffset = (scanlineOffset + 1) % 4;
-  for (int y = scanlineOffset; y < SCREEN_H; y += 4) {
-    spr.drawFastHLine(0, y, SCREEN_W, COL_SCANLINE);
-  }
-
-  // Efeito "glitch" sutil
-  if ((millis() / 200) % 7 == 0) {
-    int glitchY = random(30, SCREEN_H - 10);
-    int glitchH = random(2, 6);
-    int shift   = random(-3, 4);
-    for (int gy = glitchY; gy < glitchY + glitchH && gy < SCREEN_H; gy++) {
-      if (shift != 0) {
-        spr.drawFastHLine(shift > 0 ? shift : 0, gy,
-                          SCREEN_W - abs(shift), COL_SCANLINE);
-      }
-    }
-  }
-}
-
-// ============================================================
-// INDICADOR DE PÁGINA (pequeno, canto inferior direito)
-// ============================================================
-void drawPageIndicator() {
-  // Bolinhas indicadoras de página no canto inferior direito
-  int dotY = SCREEN_H - 8;
-  int totalW = (NUM_SCREENS - 1) * 12;
-  int dotStartX = SCREEN_W - 10 - totalW;
-  for (int i = 0; i < NUM_SCREENS; i++) {
-    int dx = dotStartX + i * 12;
-    if (i == currentScreen) {
-      spr.fillCircle(dx, dotY, 3, COL_TEXT);
-    } else {
-      spr.drawCircle(dx, dotY, 3, COL_DIM);
-    }
-  }
 }
 
 // ============================================================
@@ -539,10 +426,8 @@ uint16_t lightenColor(uint16_t color) {
   uint8_t r = (color >> 11) & 0x1F;
   uint8_t g = (color >> 5)  & 0x3F;
   uint8_t b =  color        & 0x1F;
-
   r = min(31, r + 8);
   g = min(63, g + 16);
   b = min(31, b + 8);
-
   return (r << 11) | (g << 5) | b;
 }

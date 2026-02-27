@@ -263,6 +263,7 @@ def collect_data() -> dict:
         "cpu_clk":  lhm["cpu_clk"],
         "gpu_clk":  lhm["gpu_clk"],
         "time":     time.strftime("%H:%M"),
+        "date":     time.strftime("%d %b"),
     }
 
 
